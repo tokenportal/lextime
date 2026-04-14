@@ -51,9 +51,9 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 
 const BILLING_LEVEL_NAMES: Record<number, string> = {
-  1: "Attorney",
+  1: "2nd Level",
   2: "1st Level",
-  3: "2nd Level",
+  3: "Attorney",
 };
 
 interface LocalInvoiceItem {
@@ -190,9 +190,9 @@ function SortableRow({ item, index, onUpdate, onDelete, rates, disabled }: {
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="1">Attorney</SelectItem>
+            <SelectItem value="1">2nd Level</SelectItem>
             <SelectItem value="2">1st Level</SelectItem>
-            <SelectItem value="3">2nd Level</SelectItem>
+            <SelectItem value="3">Attorney</SelectItem>
             <SelectItem value="none">Non-Billable</SelectItem>
           </SelectContent>
         </Select>
