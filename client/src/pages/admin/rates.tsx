@@ -15,9 +15,9 @@ import type { HourlyRate, Client } from "@shared/schema";
 import { Loader2, Save, DollarSign, Plus, Trash2, X } from "lucide-react";
 
 const BILLING_LEVEL_LABELS: Record<number, string> = {
-  1: "Level 1 — 2nd Level",
-  2: "Level 2 — 1st Level",
-  3: "Level 3 — Attorney",
+  1: "Rate 1",
+  2: "Rate 2",
+  3: "Rate 3",
 };
 
 interface ClientHourlyRate {
@@ -179,9 +179,9 @@ export default function RatesPage() {
         <CardContent className="space-y-6">
           <div className="grid gap-6">
             {[
-              { id: "level1", label: "Level 1 — 2nd Level", value: level1, set: setLevel1 },
-              { id: "level2", label: "Level 2 — 1st Level", value: level2, set: setLevel2 },
-              { id: "level3", label: "Level 3 — Attorney", value: level3, set: setLevel3 },
+              { id: "level1", label: "Rate 1", value: level1, set: setLevel1 },
+              { id: "level2", label: "Rate 2", value: level2, set: setLevel2 },
+              { id: "level3", label: "Rate 3", value: level3, set: setLevel3 },
             ].map(({ id, label, value, set }) => (
               <div key={id} className="space-y-2">
                 <Label htmlFor={id}>{label} ($)</Label>

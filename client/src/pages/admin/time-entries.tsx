@@ -24,11 +24,11 @@ type TimeEntryWithRelations = TimeEntry & {
   employee: User;
 };
 
-// billingLevel: 1=2nd Level, 2=1st Level, 3=Attorney, null=Non-Billable
+// billingLevel: 1=Rate 1, 2=Rate 2, 3=Rate 3, null=Non-Billable
 const BILLING_LEVELS = [
-  { value: 3, label: "Attorney" },
-  { value: 2, label: "1st Level" },
-  { value: 1, label: "2nd Level" },
+  { value: 1, label: "Rate 1" },
+  { value: 2, label: "Rate 2" },
+  { value: 3, label: "Rate 3" },
   { value: null, label: "Non-Billable" },
 ] as const;
 
