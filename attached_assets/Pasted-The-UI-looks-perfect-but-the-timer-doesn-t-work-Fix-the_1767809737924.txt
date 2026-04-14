@@ -1,0 +1,80 @@
+The UI looks perfect but the timer doesn't work. Fix the functionality:
+
+CRITICAL - The timer MUST actually count up in real time.
+
+Technical requirements:
+
+1. TIMER LOGIC (MUST IMPLEMENT):
+   - Use JavaScript setInterval() to increment seconds every 1000ms
+   - Timer must visually update every second: 00:00:01, 00:00:02, 00:00:03...
+   - Store: seconds state variable
+   - Format display as HH:MM:SS
+
+2. BUTTON STATE MANAGEMENT:
+   IDLE (initial state):
+   - Show only START button (green)
+   - Timer displays 00:00:00
+   
+   RUNNING (after clicking START):
+   - Hide START button
+   - Show PAUSE button (yellow/orange)
+   - Show STOP button (red)
+   - Timer counts up every second
+   - setInterval is active
+   
+   PAUSED (after clicking PAUSE):
+   - Hide PAUSE button
+   - Show RESUME button
+   - Show STOP button
+   - Timer stops counting but stays visible
+   - Clear setInterval
+   
+   STOPPED (after clicking STOP):
+   - Return to IDLE state
+   - Show only START button
+   - Reset timer to 00:00:00
+   - Save entry to database
+
+3. REACT CODE STRUCTURE NEEDED:
+
+const [isRunning, setIsRunning] = useState(false);
+const [isPaused, setIsPaused] = useState(false);
+const [seconds, setSeconds] = useState(0);
+
+useEffect(() => {
+  let interval = null;
+  if (isRunning && !isPaused) {
+    interval = setInterval(() => {
+      setSeconds(prevSeconds => prevSeconds + 1);
+    }, 1000);
+  }
+  return () => clearInterval(interval);
+}, [isRunning, isPaused]);
+
+const handleStart = () => {
+  setIsRunning(true);
+  setIsPaused(false);
+};
+
+const handlePause = () => {
+  setIsPaused(true);
+};
+
+const handleResume = () => {
+  setIsPaused(false);
+};
+
+const handleStop = () => {
+  // Save to database
+  setIsRunning(false);
+  setIsPaused(false);
+  setSeconds(0);
+};
+
+4. BUTTON RENDERING:
+{!isRunning && <button onClick={handleStart}>START</button>}
+{isRunning && !isPaused && <button onClick={handlePause}>PAUSE</button>}
+{isRunning && isPaused && <button onClick={handleResume}>RESUME</button>}
+{isRunning && <button onClick={handleStop}>STOP</button>}
+
+The timer MUST count up visibly on screen. Test it - click START and watch it go from 00:00:00 to 00:00:01 to 00:00:02 etc.
