@@ -1,0 +1,26 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/lextime', '.']
+
+  # Push to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/lextime']
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - lextime
+      - --image=gcr.io/$PROJECT_ID/lextime
+      - --region=us-central1
+      - --platform=managed
+      - --quiet
+
+images:
+  - 'gcr.io/$PROJECT_ID/lextime'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
