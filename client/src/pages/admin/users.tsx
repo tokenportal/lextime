@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
-import { getPermissions, AVAILABLE_ROLES, type UserRole } from "@shared/permissions";
+import { getPermissions } from "@shared/permissions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,9 +10,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Search, User, Shield, Users as UsersIcon, Pencil } from "lucide-react";
+import { Search, Shield, Pencil, ExternalLink } from "lucide-react";
+import { Link } from "wouter";
 import { useToast } from "@/hooks/use-toast";
-import type { User as UserType } from "@shared/schema";
+import type { User as UserType, Role } from "@shared/schema";
 
 export default function UsersPage() {
   const { user: currentUser } = useAuth();
@@ -24,6 +25,15 @@ export default function UsersPage() {
 
   const { data: users, isLoading } = useQuery<UserType[]>({
     queryKey: ["/api/users"],
+  });
+
+  const { data: roles = [] } = useQuery<Role[]>({
+    queryKey: ["/api/roles"],
+    queryFn: async () => {
+      const res = await fetch("/api/roles", { credentials: "include" });
+      if (!res.ok) return [];
+      return res.json();
+    },
   });
 
   const updateUserMutation = useMutation({
@@ -88,42 +98,30 @@ export default function UsersPage() {
       </div>
 
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="w-5 h-5" />
-            Role Permissions
-          </CardTitle>
-          <CardDescription>Overview of what each role can access</CardDescription>
+        <CardHeader className="flex flex-row items-start justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-2">
+              <Shield className="w-5 h-5" />
+              Roles &amp; Permissions
+            </CardTitle>
+            <CardDescription>
+              {roles.length} role{roles.length !== 1 ? "s" : ""} defined. Assign users to roles below.
+            </CardDescription>
+          </div>
+          <Link href="/admin/roles">
+            <Button variant="outline" size="sm" className="gap-2">
+              <ExternalLink className="w-4 h-4" />
+              Manage Roles
+            </Button>
+          </Link>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="p-4 rounded-lg border bg-primary/5">
-              <h3 className="font-semibold text-primary mb-2">Admin</h3>
-              <ul className="text-sm text-muted-foreground space-y-1">
-                <li>Full access to all features</li>
-                <li>Can manage users and roles</li>
-                <li>Can view and generate invoices</li>
-                <li>Can set rates and manage tasks</li>
-              </ul>
-            </div>
-            <div className="p-4 rounded-lg border bg-accent/5">
-              <h3 className="font-semibold text-accent mb-2">Assistant</h3>
-              <ul className="text-sm text-muted-foreground space-y-1">
-                <li>Can view and edit clients</li>
-                <li>Cannot view client details page</li>
-                <li>No access to invoices or rates</li>
-                <li>No time tracker access</li>
-              </ul>
-            </div>
-            <div className="p-4 rounded-lg border bg-muted">
-              <h3 className="font-semibold mb-2">Accountant</h3>
-              <ul className="text-sm text-muted-foreground space-y-1">
-                <li>Time tracker access only</li>
-                <li>Can track billable hours</li>
-                <li>No admin portal access</li>
-                <li>Cannot view client or invoice data</li>
-              </ul>
-            </div>
+          <div className="flex flex-wrap gap-2">
+            {roles.map(r => (
+              <span key={r.id} className="px-3 py-1.5 rounded-full text-sm bg-primary/10 text-primary font-medium border border-primary/20">
+                {r.name}
+              </span>
+            ))}
           </div>
         </CardContent>
       </Card>
@@ -222,8 +220,8 @@ export default function UsersPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {AVAILABLE_ROLES.map((role) => (
-                      <SelectItem key={role} value={role}>{role}</SelectItem>
+                    {roles.map((role) => (
+                      <SelectItem key={role.id} value={role.name}>{role.name}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>

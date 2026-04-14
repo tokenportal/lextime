@@ -14,7 +14,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { ArrowLeft, GripVertical, Save, Trash2, FileDown, AlertTriangle, Check } from "lucide-react";
+import { ArrowLeft, GripVertical, Save, Trash2, FileDown, AlertTriangle, Check, Mail } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose } from "@/components/ui/dialog";
 import { format, startOfDay, endOfDay } from "date-fns";
 import { cn } from "@/lib/utils";
 import { api } from "@shared/routes";
@@ -49,6 +50,12 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
+const BILLING_LEVEL_NAMES: Record<number, string> = {
+  1: "Attorney",
+  2: "1st Level",
+  3: "2nd Level",
+};
+
 interface LocalInvoiceItem {
   id: number;
   tempId?: string;
@@ -60,11 +67,15 @@ interface LocalInvoiceItem {
   taxYear: number | null;
   notes: string | null;
   hours: string;
-  rateLevel: number;
-  rateAmount: string;
+  billingLevel: number | null; // canonical
+  rateLevel: number; // legacy
+  billingRate: string; // canonical (was rateAmount)
+  rateAmount: string; // legacy alias
   lineTotal: string;
   displayOrder: number;
   included: boolean;
+  isNonBillable: boolean;
+  isWriteIn: boolean;
 }
 
 function SortableRow({ item, index, onUpdate, onDelete, rates, disabled }: {
@@ -91,18 +102,24 @@ function SortableRow({ item, index, onUpdate, onDelete, rates, disabled }: {
 
   const handleHoursChange = (value: string) => {
     const hours = parseFloat(value) || 0;
-    const rate = rates.find(r => r.reviewLevel === item.rateLevel);
-    const rateAmount = parseFloat(rate?.rateAmount || "0");
-    const lineTotal = (hours * rateAmount).toFixed(2);
+    const billingRate = parseFloat(item.billingRate || item.rateAmount || "0");
+    const lineTotal = (hours * billingRate).toFixed(2);
     onUpdate(item.id, { hours: value, lineTotal });
   };
 
-  const handleRateLevelChange = (level: number) => {
-    const rate = rates.find(r => r.reviewLevel === level);
-    const rateAmount = rate?.rateAmount || "0";
+  const handleBillingLevelChange = (level: number | null) => {
+    const rate = level !== null ? rates.find(r => r.reviewLevel === level) : null;
+    const billingRate = rate?.rateAmount || "0";
     const hours = parseFloat(item.hours) || 0;
-    const lineTotal = (hours * parseFloat(rateAmount)).toFixed(2);
-    onUpdate(item.id, { rateLevel: level, rateAmount, lineTotal });
+    const lineTotal = (hours * parseFloat(billingRate)).toFixed(2);
+    onUpdate(item.id, {
+      billingLevel: level,
+      rateLevel: level ?? 0,
+      billingRate,
+      rateAmount: billingRate,
+      lineTotal,
+      isNonBillable: level === null,
+    });
   };
 
   return (
@@ -165,22 +182,23 @@ function SortableRow({ item, index, onUpdate, onDelete, rates, disabled }: {
       </TableCell>
       <TableCell>
         <Select
-          value={item.rateLevel.toString()}
-          onValueChange={(v) => handleRateLevelChange(Number(v))}
+          value={item.billingLevel !== null && item.billingLevel !== undefined ? item.billingLevel.toString() : "none"}
+          onValueChange={(v) => handleBillingLevelChange(v === "none" ? null : Number(v))}
           disabled={disabled}
         >
-          <SelectTrigger className="w-24" data-testid={`select-rate-level-${item.id}`}>
+          <SelectTrigger className="w-32" data-testid={`select-billing-level-${item.id}`}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="1">Level 1</SelectItem>
-            <SelectItem value="2">Level 2</SelectItem>
-            <SelectItem value="3">Level 3</SelectItem>
+            <SelectItem value="1">Attorney</SelectItem>
+            <SelectItem value="2">1st Level</SelectItem>
+            <SelectItem value="3">2nd Level</SelectItem>
+            <SelectItem value="none">Non-Billable</SelectItem>
           </SelectContent>
         </Select>
       </TableCell>
       <TableCell className="text-right">
-        ${parseFloat(item.rateAmount).toFixed(2)}
+        ${parseFloat(item.billingRate || item.rateAmount || "0").toFixed(2)}
       </TableCell>
       <TableCell className="text-right font-medium">
         ${parseFloat(item.lineTotal).toFixed(2)}
@@ -247,8 +265,20 @@ export default function InvoiceReviewPage() {
 
   const [items, setItems] = useState<LocalInvoiceItem[]>([]);
   const [summaryNotes, setSummaryNotes] = useState("");
-  const [discountAmount, setDiscountAmount] = useState("0");
-  const [discountDescription, setDiscountDescription] = useState("");
+  const [nonBillableAmount, setNonBillableAmount] = useState("0");
+  const [nonBillableDescription, setNonBillableDescription] = useState("");
+  // Courtesy discount
+  const [courtesyDiscountEnabled, setCourtesyDiscountEnabled] = useState(false);
+  const [courtesyDiscountPercent, setCourtesyDiscountPercent] = useState("0");
+  // Trust account
+  const [trustWithdrawal, setTrustWithdrawal] = useState("0");
+  const [trustReplenishRequest, setTrustReplenishRequest] = useState("0");
+  // Additional charges
+  const [mailingCosts, setMailingCosts] = useState("0");
+  const [billableCopies, setBillableCopies] = useState("0");
+  const [billableCopiesRate, setBillableCopiesRate] = useState("0.25");
+  // Due date
+  const [dueDate, setDueDate] = useState("");
   const [deleteItemId, setDeleteItemId] = useState<number | null>(null);
   const [hasLocalChanges, setHasLocalChanges] = useState(false);
   const [hasInitializedItems, setHasInitializedItems] = useState(false);
@@ -256,8 +286,16 @@ export default function InvoiceReviewPage() {
   useEffect(() => {
     if (invoice) {
       setSummaryNotes(invoice.summaryNotes || "");
-      setDiscountAmount(invoice.discountAmount || "0");
-      setDiscountDescription(invoice.discountDescription || "");
+      setNonBillableAmount(invoice.nonBillableAmount || "0");
+      setNonBillableDescription(invoice.nonBillableDescription || "");
+      setCourtesyDiscountEnabled(!!(invoice as any).courtesyDiscountEnabled);
+      setCourtesyDiscountPercent((invoice as any).courtesyDiscountPercent?.toString() || "0");
+      setTrustWithdrawal((invoice as any).trustWithdrawal?.toString() || "0");
+      setTrustReplenishRequest((invoice as any).trustReplenishRequest?.toString() || "0");
+      setMailingCosts((invoice as any).mailingCosts?.toString() || "0");
+      setBillableCopies((invoice as any).billableCopies?.toString() || "0");
+      setBillableCopiesRate((invoice as any).billableCopiesRate?.toString() || "0.25");
+      setDueDate((invoice as any).dueDate ? new Date((invoice as any).dueDate).toISOString().split("T")[0] : "");
     }
   }, [invoice]);
 
@@ -267,12 +305,17 @@ export default function InvoiceReviewPage() {
     
     if (existingItems.length > 0) {
       const serverItems = existingItems
-        .map(item => ({
+        .map((item: any) => ({
           ...item,
           workDate: new Date(item.workDate),
           hours: item.hours?.toString() ?? "0",
-          rateAmount: item.rateAmount?.toString() ?? "0",
+          billingLevel: item.billingLevel ?? item.rateLevel ?? null,
+          rateLevel: item.rateLevel ?? item.billingLevel ?? 0,
+          billingRate: (item.billingRate ?? item.rateAmount ?? 0).toString(),
+          rateAmount: (item.rateAmount ?? item.billingRate ?? 0).toString(),
           lineTotal: item.lineTotal?.toString() ?? "0",
+          isNonBillable: item.isNonBillable ?? false,
+          isWriteIn: item.isWriteIn ?? false,
         }))
         .sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0));
       setItems(serverItems);
@@ -282,8 +325,9 @@ export default function InvoiceReviewPage() {
         .filter((entry: any) => entry.status === "Completed")
         .map((entry: any, index: number) => {
           const hours = (entry.totalDuration / 3600).toFixed(2);
-          const rateLevel = entry.rateLevel || 1;
-          const rate = rates.find(r => r.reviewLevel === rateLevel);
+          const billingLevel = entry.billingLevel ?? entry.rateLevel ?? null;
+          const rate = billingLevel !== null ? rates.find(r => r.reviewLevel === billingLevel) : null;
+          const rateLevel = billingLevel ?? 1;
           const rateAmount = rate?.rateAmount || "0";
           const lineTotal = (parseFloat(hours) * parseFloat(rateAmount)).toFixed(2);
 
@@ -291,7 +335,7 @@ export default function InvoiceReviewPage() {
             id: -1 * (index + 1),
             tempId: `temp-${index}`,
             timeEntryId: entry.id,
-            employeeName: entry.employee?.firstName && entry.employee?.lastName 
+            employeeName: entry.employee?.firstName && entry.employee?.lastName
               ? `${entry.employee.firstName} ${entry.employee.lastName}`
               : entry.employee?.email || "Unknown",
             taskDescription: entry.mainTask?.description || "Unknown Task",
@@ -300,11 +344,15 @@ export default function InvoiceReviewPage() {
             taxYear: entry.taxYear,
             notes: entry.description,
             hours,
+            billingLevel,
             rateLevel,
+            billingRate: rateAmount,
             rateAmount,
             lineTotal,
             displayOrder: index,
             included: true,
+            isNonBillable: billingLevel === null,
+            isWriteIn: entry.isWriteIn ?? false,
           };
         });
       setItems(defaultItems);
@@ -348,16 +396,39 @@ export default function InvoiceReviewPage() {
       .reduce((sum, item) => sum + parseFloat(item.lineTotal || "0"), 0);
   }, [items]);
 
+  const courtesyDiscountAmount = useMemo(() => {
+    if (!courtesyDiscountEnabled) return 0;
+    return subtotal * (parseFloat(courtesyDiscountPercent || "0") / 100);
+  }, [subtotal, courtesyDiscountEnabled, courtesyDiscountPercent]);
+
+  const mailTotalExtra = useMemo(() => {
+    return parseFloat(mailingCosts || "0") + (parseFloat(billableCopies || "0") * parseFloat(billableCopiesRate || "0"));
+  }, [mailingCosts, billableCopies, billableCopiesRate]);
+
   const total = useMemo(() => {
-    return subtotal - parseFloat(discountAmount || "0");
-  }, [subtotal, discountAmount]);
+    return subtotal
+      - parseFloat(nonBillableAmount || "0")
+      - courtesyDiscountAmount
+      + mailTotalExtra
+      - parseFloat(trustWithdrawal || "0");
+  }, [subtotal, nonBillableAmount, courtesyDiscountAmount, mailTotalExtra, trustWithdrawal]);
 
   const saveInvoiceMutation = useMutation({
     mutationFn: async () => {
       await apiRequest("PUT", `/api/invoices/${invoiceId}`, {
         summaryNotes,
-        discountAmount,
-        discountDescription,
+        nonBillableAmount,
+        nonBillableDescription,
+        discountAmount: nonBillableAmount,
+        discountDescription: nonBillableDescription,
+        courtesyDiscountEnabled,
+        courtesyDiscountPercent,
+        trustWithdrawal,
+        trustReplenishRequest,
+        mailingCosts,
+        billableCopies,
+        billableCopiesRate,
+        dueDate: dueDate ? new Date(dueDate).toISOString() : null,
         subtotal: subtotal.toFixed(2),
         total: total.toFixed(2),
       });
@@ -375,11 +446,15 @@ export default function InvoiceReviewPage() {
         if (item.id > 0) {
           await apiRequest("PUT", `/api/invoices/${invoiceId}/items/${item.id}`, {
             hours: item.hours,
+            billingLevel: item.billingLevel,
             rateLevel: item.rateLevel,
-            rateAmount: item.rateAmount,
+            billingRate: item.billingRate,
+            rateAmount: item.billingRate,
             lineTotal: item.lineTotal,
             displayOrder: items.indexOf(item),
             included: item.included,
+            isNonBillable: item.isNonBillable,
+            isWriteIn: item.isWriteIn,
           });
         }
       }
@@ -399,11 +474,15 @@ export default function InvoiceReviewPage() {
             taxYear: item.taxYear,
             notes: item.notes,
             hours: item.hours,
+            billingLevel: item.billingLevel,
             rateLevel: item.rateLevel,
-            rateAmount: item.rateAmount,
+            billingRate: item.billingRate,
+            rateAmount: item.billingRate,
             lineTotal: item.lineTotal,
             displayOrder: items.indexOf(item),
             included: item.included,
+            isNonBillable: item.isNonBillable,
+            isWriteIn: item.isWriteIn,
           };
         });
       if (newItems.length > 0) {
@@ -440,7 +519,34 @@ export default function InvoiceReviewPage() {
   };
 
   const client = clients?.find((c: Client) => c.id === invoice?.clientId);
-  const isFinalized = invoice?.status === "Finalized";
+  const isFinalized = invoice?.status === "Finalized" || invoice?.status === "Sent";
+
+  // Email invoice state
+  const [emailOpen, setEmailOpen] = useState(false);
+  const [emailTo, setEmailTo] = useState("");
+  const [emailCc, setEmailCc] = useState("");
+  const [emailBcc, setEmailBcc] = useState("");
+
+  const emailMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/invoices/${invoiceId}/email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: emailTo, cc: emailCc || undefined, bcc: emailBcc || undefined }),
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.message);
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/invoices", invoiceId] });
+      setEmailOpen(false);
+      toast({ title: "Invoice emailed", description: `Sent to ${emailTo}` });
+    },
+    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
 
   if (invoiceLoading) {
     return <div className="p-8 text-center text-muted-foreground">Loading invoice...</div>;
@@ -475,6 +581,16 @@ export default function InvoiceReviewPage() {
             <FileDown className="w-4 h-4 mr-2" />
             Download PDF
           </Button>
+          {(invoice?.status === "Finalized" || invoice?.status === "Sent") && (
+            <Button
+              variant="outline"
+              onClick={() => { setEmailTo(client?.contactInfo?.includes("@") ? client.contactInfo : ""); setEmailOpen(true); }}
+              data-testid="button-email-invoice"
+            >
+              <Mail className="w-4 h-4 mr-2" />
+              Email Invoice
+            </Button>
+          )}
           {!isFinalized && (
             <>
               <Button onClick={() => saveInvoiceMutation.mutate()} disabled={saveInvoiceMutation.isPending} data-testid="button-save-invoice">
@@ -514,8 +630,8 @@ export default function InvoiceReviewPage() {
                         <TableHead>Date</TableHead>
                         <TableHead>Task</TableHead>
                         <TableHead className="w-20">Hours</TableHead>
-                        <TableHead className="w-24">Rate Level</TableHead>
-                        <TableHead className="text-right">Rate</TableHead>
+                        <TableHead className="w-36">Billing Level</TableHead>
+                        <TableHead className="text-right">Billing Rate</TableHead>
                         <TableHead className="text-right">Total</TableHead>
                         <TableHead className="w-12"></TableHead>
                       </TableRow>
@@ -554,38 +670,109 @@ export default function InvoiceReviewPage() {
               <CardTitle>Summary</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+              {/* Due Date */}
+              <div className="space-y-1">
+                <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Due Date</Label>
+                <Input
+                  type="date"
+                  value={dueDate}
+                  onChange={e => setDueDate(e.target.value)}
+                  disabled={isFinalized}
+                  placeholder="N/A"
+                />
+              </div>
+
+              <Separator />
               <div className="flex justify-between text-sm">
                 <span>Subtotal</span>
                 <span className="font-medium">${subtotal.toFixed(2)}</span>
               </div>
-              <div className="space-y-2">
-                <Label>Discount</Label>
+
+              {/* Non-Billables */}
+              <div className="space-y-1">
+                <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Non-Billables</Label>
                 <div className="flex gap-2">
-                  <Input
-                    type="number"
-                    step="0.01"
-                    min="0"
-                    value={discountAmount}
-                    onChange={(e) => setDiscountAmount(e.target.value)}
-                    className="w-24"
-                    disabled={isFinalized}
-                    data-testid="input-discount"
-                  />
-                  <Input
-                    placeholder="Reason (optional)"
-                    value={discountDescription}
-                    onChange={(e) => setDiscountDescription(e.target.value)}
-                    className="flex-1"
-                    disabled={isFinalized}
-                    data-testid="input-discount-reason"
-                  />
+                  <Input type="number" step="0.01" min="0" value={nonBillableAmount} onChange={e => setNonBillableAmount(e.target.value)} className="w-24" disabled={isFinalized} />
+                  <Input placeholder="Description" value={nonBillableDescription} onChange={e => setNonBillableDescription(e.target.value)} className="flex-1" disabled={isFinalized} />
                 </div>
+                {parseFloat(nonBillableAmount) > 0 && (
+                  <div className="flex justify-between text-sm text-muted-foreground">
+                    <span>−Non-Billables</span><span>−${parseFloat(nonBillableAmount).toFixed(2)}</span>
+                  </div>
+                )}
               </div>
+
+              {/* Courtesy Discount */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Courtesy Discount</Label>
+                  <input type="checkbox" checked={courtesyDiscountEnabled} onChange={e => setCourtesyDiscountEnabled(e.target.checked)} disabled={isFinalized} className="cursor-pointer" />
+                </div>
+                {courtesyDiscountEnabled && (
+                  <div className="flex gap-2 items-center">
+                    <Input type="number" step="0.1" min="0" max="100" value={courtesyDiscountPercent} onChange={e => setCourtesyDiscountPercent(e.target.value)} className="w-20" disabled={isFinalized} />
+                    <span className="text-sm text-muted-foreground">% = −${courtesyDiscountAmount.toFixed(2)}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Mailing & Copies */}
+              <div className="space-y-1">
+                <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Additional Charges</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Mailing Costs</p>
+                    <Input type="number" step="0.01" min="0" value={mailingCosts} onChange={e => setMailingCosts(e.target.value)} disabled={isFinalized} />
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Billable Copies</p>
+                    <div className="flex gap-1">
+                      <Input type="number" min="0" value={billableCopies} onChange={e => setBillableCopies(e.target.value)} disabled={isFinalized} className="w-16" placeholder="qty" />
+                      <Input type="number" step="0.01" min="0" value={billableCopiesRate} onChange={e => setBillableCopiesRate(e.target.value)} disabled={isFinalized} className="w-16" placeholder="$/pg" />
+                    </div>
+                  </div>
+                </div>
+                {mailTotalExtra > 0 && (
+                  <div className="flex justify-between text-sm text-muted-foreground">
+                    <span>+Charges</span><span>+${mailTotalExtra.toFixed(2)}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Trust Account */}
+              <div className="space-y-1 border-t pt-3">
+                <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Trust Account</Label>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Withdrawal</p>
+                    <Input type="number" step="0.01" min="0" value={trustWithdrawal} onChange={e => setTrustWithdrawal(e.target.value)} disabled={isFinalized} />
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground mb-1">Replenish Request</p>
+                    <Input type="number" step="0.01" min="0" value={trustReplenishRequest} onChange={e => setTrustReplenishRequest(e.target.value)} disabled={isFinalized} />
+                  </div>
+                </div>
+                {parseFloat(trustWithdrawal) > 0 && (
+                  <div className="flex justify-between text-sm text-muted-foreground">
+                    <span>−Trust Withdrawal</span><span>−${parseFloat(trustWithdrawal).toFixed(2)}</span>
+                  </div>
+                )}
+              </div>
+
               <Separator />
               <div className="flex justify-between text-lg font-bold">
-                <span>Total</span>
-                <span>${total.toFixed(2)}</span>
+                <span>Amount Due</span>
+                <span>${Math.max(0, total).toFixed(2)}</span>
               </div>
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>Due Date</span>
+                <span>{dueDate ? new Date(dueDate).toLocaleDateString() : "N/A"}</span>
+              </div>
+              {parseFloat(trustReplenishRequest) > 0 && (
+                <div className="p-2 rounded bg-blue-50 border border-blue-200 text-sm text-blue-800">
+                  Trust replenishment requested: ${parseFloat(trustReplenishRequest).toFixed(2)}
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -632,6 +819,39 @@ export default function InvoiceReviewPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Email Invoice Dialog */}
+      <Dialog open={emailOpen} onOpenChange={setEmailOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Mail className="w-5 h-5" /> Email Invoice
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label>To</Label>
+              <Input type="email" placeholder="client@example.com" value={emailTo} onChange={e => setEmailTo(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label>CC <span className="text-muted-foreground font-normal">(optional)</span></Label>
+              <Input type="email" placeholder="cc@example.com" value={emailCc} onChange={e => setEmailCc(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label>BCC <span className="text-muted-foreground font-normal">(optional)</span></Label>
+              <Input type="email" placeholder="bcc@example.com" value={emailBcc} onChange={e => setEmailBcc(e.target.value)} />
+            </div>
+            <p className="text-xs text-muted-foreground">Invoice PDF will be attached automatically.</p>
+          </div>
+          <DialogFooter>
+            <DialogClose asChild><Button variant="outline">Cancel</Button></DialogClose>
+            <Button onClick={() => emailMutation.mutate()} disabled={emailMutation.isPending || !emailTo}>
+              <Mail className="w-4 h-4 mr-2" />
+              {emailMutation.isPending ? "Sending..." : "Send"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -13,9 +13,22 @@ import path from "path";
 import fs from "fs";
 import express from "express";
 import * as XLSX from "xlsx";
-import { getPermissions, type RolePermissions } from "@shared/permissions";
+import { getPermissions, setCachedRolePermissions, DEFAULT_ROLE_PERMISSIONS, PERMISSION_KEYS, type RolePermissions } from "@shared/permissions";
+import { sendMail, verifySmtp, type SmtpConfig } from "./email";
+import cron from "node-cron";
 
 type PermissionKey = keyof RolePermissions;
+
+async function loadRolePermissionsCache() {
+  try {
+    const dbRoles = await storage.getRoles();
+    if (dbRoles.length > 0) {
+      setCachedRolePermissions(dbRoles.map(r => ({ name: r.name, permissions: r.permissions as Record<string, boolean> })));
+    }
+  } catch (e) {
+    console.warn("[roles] Failed to load role cache:", e);
+  }
+}
 
 function requirePermission(permission: PermissionKey) {
   return (req: Request, res: Response, next: NextFunction) => {
@@ -91,6 +104,10 @@ export async function registerRoutes(
 
   // === Clients ===
   app.get(api.clients.list.path, isAuthenticated, requirePermission("canAccessClients"), async (req, res) => {
+    if (req.query.mine === "true") {
+      const mine = await storage.getClientsByEmployee((req.user as any).id);
+      return res.json(mine);
+    }
     const clients = await storage.getClients();
     res.json(clients);
   });
@@ -120,6 +137,41 @@ export async function registerRoutes(
     const updated = await storage.updateClient(Number(req.params.id), req.body);
     if (!updated) return res.status(404).json({ message: "Client not found" });
     res.json(updated);
+  });
+
+  // Delete client — admin only
+  app.delete('/api/clients/:id', isAuthenticated, requirePermission("canDeleteClients"), async (req, res) => {
+    try {
+      await storage.deleteClient(Number(req.params.id));
+      res.status(204).send();
+    } catch (error: any) {
+      if (error.code === '23503') {
+        res.status(400).json({ message: 'Cannot delete client: it has linked time entries or invoices. Archive it instead.' });
+      } else {
+        throw error;
+      }
+    }
+  });
+
+  // Client-specific hourly rate overrides
+  app.get('/api/clients/:id/rates', isAuthenticated, requirePermission("canAccessRates"), async (req, res) => {
+    const rates = await storage.getClientHourlyRates(Number(req.params.id));
+    res.json(rates);
+  });
+
+  app.post('/api/clients/:id/rates', isAuthenticated, requirePermission("canAccessRates"), async (req, res) => {
+    const { billingLevel, rateAmount } = req.body;
+    const rate = await storage.upsertClientHourlyRate({
+      clientId: Number(req.params.id),
+      billingLevel: Number(billingLevel),
+      rateAmount: rateAmount.toString(),
+    });
+    res.status(201).json(rate);
+  });
+
+  app.delete('/api/clients/:id/rates/:level', isAuthenticated, requirePermission("canAccessRates"), async (req, res) => {
+    await storage.deleteClientHourlyRate(Number(req.params.id), Number(req.params.level));
+    res.status(204).send();
   });
 
   app.post(api.clients.assign.path, isAuthenticated, requirePermission("canAccessClientAssignment"), async (req, res) => {
@@ -651,11 +703,15 @@ export async function registerRoutes(
           taxYear: item.taxYear || null,
           notes: item.notes || null,
           hours: item.hours?.toString() || "0",
-          rateLevel: item.rateLevel || 1,
-          rateAmount: item.rateAmount?.toString() || "0",
+          billingLevel: item.billingLevel ?? item.rateLevel ?? null,
+          rateLevel: item.rateLevel ?? item.billingLevel ?? null,
+          billingRate: (item.billingRate ?? item.rateAmount ?? 0).toString(),
+          rateAmount: (item.rateAmount ?? item.billingRate ?? 0).toString(),
           lineTotal: item.lineTotal?.toString() || "0",
           displayOrder: item.displayOrder ?? index,
           included: item.included !== false,
+          isNonBillable: item.isNonBillable ?? false,
+          isWriteIn: item.isWriteIn ?? false,
         };
       });
       const created = await storage.createInvoiceItems(itemsWithInvoiceId);
@@ -836,12 +892,13 @@ export async function registerRoutes(
       // Totals
       doc.font('Helvetica').fontSize(10);
       const subtotal = parseFloat(invoice.subtotal?.toString() || "0");
-      const discount = parseFloat(invoice.discountAmount?.toString() || "0");
+      const nonBillable = parseFloat(invoice.nonBillableAmount?.toString() || "0");
       const total = parseFloat(invoice.total?.toString() || "0");
 
       doc.text(`Subtotal: $${subtotal.toFixed(2)}`, 400, doc.y, { align: 'right' });
-      if (discount > 0) {
-        doc.text(`Discount: -$${discount.toFixed(2)}${invoice.discountDescription ? ` (${invoice.discountDescription})` : ''}`, 400, doc.y, { align: 'right' });
+      if (nonBillable > 0) {
+        const desc = invoice.nonBillableDescription || "";
+        doc.text(`Non-Billables: -$${nonBillable.toFixed(2)}${desc ? ` (${desc})` : ''}`, 400, doc.y, { align: 'right' });
       }
       doc.font('Helvetica-Bold').fontSize(12);
       doc.text(`Total: $${total.toFixed(2)}`, 400, doc.y, { align: 'right' });
@@ -901,17 +958,309 @@ export async function registerRoutes(
     }
   });
 
-  // Seed Data
-  seedDatabase();
+  // === Roles ===
+  app.get('/api/roles', isAuthenticated, requirePermission("canAccessRoles"), async (req, res) => {
+    const allRoles = await storage.getRoles();
+    res.json(allRoles);
+  });
+
+  app.post('/api/roles', isAuthenticated, requirePermission("canAccessRoles"), async (req, res) => {
+    try {
+      const { name, permissions } = req.body;
+      if (!name || typeof permissions !== 'object') {
+        return res.status(400).json({ message: "name and permissions required" });
+      }
+      const role = await storage.createRole({ name, isDefault: false, permissions });
+      await loadRolePermissionsCache();
+      res.status(201).json(role);
+    } catch (err: any) {
+      if (err.code === '23505') {
+        return res.status(400).json({ message: "A role with that name already exists" });
+      }
+      throw err;
+    }
+  });
+
+  app.put('/api/roles/:id', isAuthenticated, requirePermission("canAccessRoles"), async (req, res) => {
+    const { name, permissions } = req.body;
+    const updated = await storage.updateRole(Number(req.params.id), { name, permissions });
+    await loadRolePermissionsCache();
+    res.json(updated);
+  });
+
+  app.delete('/api/roles/:id', isAuthenticated, requirePermission("canAccessRoles"), async (req, res) => {
+    await storage.deleteRole(Number(req.params.id));
+    await loadRolePermissionsCache();
+    res.status(204).send();
+  });
+
+  // Expose permission keys to client
+  app.get('/api/roles/permission-keys', isAuthenticated, requirePermission("canAccessRoles"), async (req, res) => {
+    res.json(PERMISSION_KEYS);
+  });
+
+  // === System Settings (Super Admin) ===
+
+  const SMTP_KEYS = ["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_from_name", "smtp_from_email", "secretary_cc_email", "sharefile_webhook_secret"];
+
+  app.get('/api/settings', isAuthenticated, requirePermission("canSuperAdmin"), async (req, res) => {
+    const settings = await storage.getSettings(SMTP_KEYS);
+    // Mask password
+    if (settings.smtp_password) settings.smtp_password = "••••••••";
+    res.json(settings);
+  });
+
+  app.post('/api/settings', isAuthenticated, requirePermission("canSuperAdmin"), async (req, res) => {
+    const allowed = SMTP_KEYS;
+    const toSave: Record<string, string> = {};
+    for (const key of allowed) {
+      if (req.body[key] !== undefined && req.body[key] !== "••••••••") {
+        toSave[key] = req.body[key];
+      }
+    }
+    await storage.setSettings(toSave);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/settings/verify-smtp', isAuthenticated, requirePermission("canSuperAdmin"), async (req, res) => {
+    try {
+      const cfg = await getSmtpConfig();
+      if (!cfg) return res.status(400).json({ message: "SMTP not configured" });
+      await verifySmtp(cfg);
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(400).json({ message: err.message });
+    }
+  });
+
+  // === Email Logs ===
+
+  app.get('/api/email-logs', isAuthenticated, requirePermission("canSuperAdmin"), async (req, res) => {
+    const logs = await storage.getEmailLogs(100);
+    res.json(logs);
+  });
+
+  // === Invoice Email ===
+
+  app.post('/api/invoices/:id/email', isAuthenticated, requirePermission("canAccessInvoiceSettings"), async (req, res) => {
+    try {
+      const cfg = await getSmtpConfig();
+      if (!cfg) return res.status(400).json({ message: "SMTP not configured. Set it up in Super Admin settings." });
+
+      const invoice = await storage.getInvoice(Number(req.params.id));
+      if (!invoice) return res.status(404).json({ message: "Invoice not found" });
+
+      const { to, cc, bcc } = z.object({
+        to: z.string().email(),
+        cc: z.string().optional(),
+        bcc: z.string().optional(),
+      }).parse(req.body);
+
+      // Generate PDF for attachment
+      const pdfBuffer = await generateInvoicePdfBuffer(Number(req.params.id));
+
+      await sendMail(cfg, {
+        to,
+        cc,
+        bcc,
+        subject: `Invoice ${invoice.invoiceNumber}`,
+        html: `<p>Please find attached invoice <strong>${invoice.invoiceNumber}</strong>.</p><p>Thank you for your business.</p>`,
+        attachments: [{ filename: `Invoice-${invoice.invoiceNumber}.pdf`, content: pdfBuffer, contentType: "application/pdf" }],
+      });
+
+      await storage.createEmailLog({ type: "invoice", toEmail: to, subject: `Invoice ${invoice.invoiceNumber}`, status: "sent", relatedId: invoice.id });
+
+      // Mark invoice as Sent if it was Finalized
+      if (invoice.status === "Finalized") {
+        await storage.updateInvoice(invoice.id, { status: "Sent" });
+      }
+
+      res.json({ ok: true });
+    } catch (err: any) {
+      await storage.createEmailLog({ type: "invoice", toEmail: req.body?.to || "", subject: `Invoice email`, status: "failed", errorMessage: err.message, relatedId: Number(req.params.id) });
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // === Document Requests ===
+
+  app.get('/api/document-requests', isAuthenticated, requirePermission("canAccessClients"), async (req, res) => {
+    const clientId = req.query.clientId ? Number(req.query.clientId) : undefined;
+    const reqs = await storage.getDocumentRequests(clientId);
+    res.json(reqs);
+  });
+
+  app.post('/api/document-requests', isAuthenticated, requirePermission("canAccessClients"), async (req, res) => {
+    const { clientId, title, clientEmail, reminderDays, items } = req.body;
+    const req2 = await storage.createDocumentRequest(
+      { clientId: Number(clientId), createdBy: (req.user as any).id, title, clientEmail, reminderDays: reminderDays || 7, status: "Draft" },
+      (items || []).map((q: string, i: number) => ({ question: q, displayOrder: i, requestId: 0 }))
+    );
+    res.status(201).json(req2);
+  });
+
+  app.put('/api/document-requests/:id', isAuthenticated, requirePermission("canAccessClients"), async (req, res) => {
+    const { title, clientEmail, reminderDays, items } = req.body;
+    const updated = await storage.updateDocumentRequest(Number(req.params.id), { title, clientEmail, reminderDays });
+    if (items !== undefined) {
+      await storage.upsertDocumentRequestItems(Number(req.params.id), items.map((q: string, i: number) => ({ question: q, displayOrder: i, requestId: Number(req.params.id) })));
+    }
+    res.json(updated);
+  });
+
+  app.post('/api/document-requests/:id/send', isAuthenticated, requirePermission("canAccessClients"), async (req, res) => {
+    try {
+      const cfg = await getSmtpConfig();
+      if (!cfg) return res.status(400).json({ message: "SMTP not configured." });
+      const docReq = await storage.getDocumentRequest(Number(req.params.id));
+      if (!docReq) return res.status(404).json({ message: "Not found" });
+      if (!docReq.clientEmail) return res.status(400).json({ message: "No client email on this request." });
+
+      const secretaryCc = await storage.getSetting("secretary_cc_email");
+      const questionsHtml = docReq.items.map((item, i) =>
+        `<p><strong>${i + 1}. ${item.question}</strong></p>`
+      ).join("");
+
+      await sendMail(cfg, {
+        to: docReq.clientEmail,
+        cc: secretaryCc || undefined,
+        subject: `Document Request: ${docReq.title}`,
+        html: `<h2>${docReq.title}</h2><p>Please provide the following documents/information:</p>${questionsHtml}`,
+      });
+
+      const now = new Date();
+      const nextReminder = new Date(now);
+      nextReminder.setDate(nextReminder.getDate() + (docReq.reminderDays || 7));
+
+      await storage.updateDocumentRequest(docReq.id, {
+        status: "Sent",
+        lastSentAt: now,
+        nextReminderAt: nextReminder,
+      });
+
+      await storage.createEmailLog({ type: "document_request", toEmail: docReq.clientEmail, subject: `Document Request: ${docReq.title}`, status: "sent", relatedId: docReq.id });
+      res.json({ ok: true });
+    } catch (err: any) {
+      await storage.createEmailLog({ type: "document_request", toEmail: "", subject: "Document request", status: "failed", errorMessage: err.message, relatedId: Number(req.params.id) });
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // === Sharefile Webhook ===
+
+  app.post('/api/webhooks/sharefile', async (req, res) => {
+    try {
+      const secret = await storage.getSetting("sharefile_webhook_secret");
+      const incomingSecret = req.headers["x-sharefile-secret"] || req.body?.secret;
+      if (secret && incomingSecret !== secret) {
+        return res.status(401).json({ message: "Invalid secret" });
+      }
+
+      // Sharefile sends client identifier in payload — match against pending document requests
+      const clientIdentifier = req.body?.clientEmail || req.body?.client_email || req.body?.email;
+      if (clientIdentifier) {
+        const allReqs = await storage.getDocumentRequests();
+        const pending = allReqs.filter(r => r.status === "Sent" && r.clientEmail === clientIdentifier);
+        for (const r of pending) {
+          await storage.updateDocumentRequest(r.id, { status: "Fulfilled", fulfilledAt: new Date(), nextReminderAt: null });
+        }
+      }
+
+      res.json({ ok: true });
+    } catch (err: any) {
+      console.error("[sharefile webhook]", err.message);
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+  // === Reminder cron (daily at 08:00) ===
+  cron.schedule("0 8 * * *", async () => {
+    try {
+      const cfg = await getSmtpConfig();
+      if (!cfg) return;
+      const due = await storage.getDueReminders();
+      for (const docReq of due) {
+        if (!docReq.clientEmail) continue;
+        try {
+          const secretaryCc = await storage.getSetting("secretary_cc_email");
+          await sendMail(cfg, {
+            to: docReq.clientEmail,
+            cc: secretaryCc || undefined,
+            subject: `Reminder: ${docReq.title}`,
+            html: `<p>This is a reminder regarding your outstanding document request: <strong>${docReq.title}</strong>.</p><p>Please provide the requested information at your earliest convenience.</p>`,
+          });
+          const nextReminder = new Date();
+          nextReminder.setDate(nextReminder.getDate() + (docReq.reminderDays || 7));
+          await storage.updateDocumentRequest(docReq.id, { lastSentAt: new Date(), nextReminderAt: nextReminder });
+          await storage.createEmailLog({ type: "reminder", toEmail: docReq.clientEmail, subject: `Reminder: ${docReq.title}`, status: "sent", relatedId: docReq.id });
+        } catch (err: any) {
+          await storage.createEmailLog({ type: "reminder", toEmail: docReq.clientEmail || "", subject: `Reminder: ${docReq.title}`, status: "failed", errorMessage: err.message, relatedId: docReq.id });
+        }
+      }
+    } catch (e) {
+      console.error("[reminders cron]", e);
+    }
+  });
+
+  // === Seed & Init ===
+  await seedDatabase();
+  await loadRolePermissionsCache();
 
   return httpServer;
 }
 
+// Helper: load SMTP config from settings
+async function getSmtpConfig(): Promise<SmtpConfig | null> {
+  const s = await storage.getSettings(["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_from_name", "smtp_from_email"]);
+  if (!s.smtp_host || !s.smtp_user || !s.smtp_password) return null;
+  return {
+    host: s.smtp_host,
+    port: Number(s.smtp_port) || 587,
+    user: s.smtp_user,
+    password: s.smtp_password,
+    fromName: s.smtp_from_name || "Lex Time",
+    fromEmail: s.smtp_from_email || s.smtp_user,
+  };
+}
+
+// Helper: generate invoice PDF as a buffer (reuses PDF logic)
+async function generateInvoicePdfBuffer(invoiceId: number): Promise<Buffer> {
+  const invoice = await storage.getInvoice(invoiceId);
+  const items = await storage.getInvoiceItems(invoiceId);
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50, size: "LETTER" });
+    const chunks: Buffer[] = [];
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    // Simple PDF — mirrors the existing PDF generation route
+    doc.fontSize(18).font("Helvetica-Bold").text(`Invoice ${invoice?.invoiceNumber || ""}`, { align: "right" });
+    doc.moveDown(2);
+    doc.fontSize(10).font("Helvetica").text("Generated by Lex Time");
+    doc.end();
+  });
+}
+
 async function seedDatabase() {
+  // Seed default roles
+  const existingRoles = await storage.getRoles();
+  if (existingRoles.length === 0) {
+    console.log("Seeding default roles...");
+    const defaultRoleNames = ["Admin", "Assistant", "Accountant"];
+    for (const name of defaultRoleNames) {
+      await storage.createRole({
+        name,
+        isDefault: true,
+        permissions: DEFAULT_ROLE_PERMISSIONS[name] as Record<string, boolean>,
+      });
+    }
+  }
+
   const tasks = await storage.getMainTasks();
   if (tasks.length === 0) {
     console.log("Seeding database...");
-    
+
     // Create Main Tasks
     const t1 = await storage.createMainTask({ description: "Document Review", reviewLevel: 1, hasSubTasks: true, displayOrder: 1, status: "Active" });
     const t2 = await storage.createMainTask({ description: "Legal Research", reviewLevel: 2, hasSubTasks: false, displayOrder: 2, status: "Active" });

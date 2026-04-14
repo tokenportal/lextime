@@ -1,22 +1,30 @@
-import { 
+import {
   users, clients, clientAssignments, mainTasks, subTasks, timeEntries, hourlyRates, invoices,
   invoiceItems, invoiceSettings,
   clientTaskOverrides, clientSubtaskOverrides,
+  clientHourlyRates, roles,
+  systemSettings, documentRequests, documentRequestItems, emailLogs,
   type User, type UpsertUser,
-  type Client, type InsertClient, 
-  type MainTask, type InsertMainTask, 
-  type SubTask, type InsertSubTask, 
-  type TimeEntry, type InsertTimeEntry, 
-  type HourlyRate, type InsertHourlyRate, 
+  type Client, type InsertClient,
+  type MainTask, type InsertMainTask,
+  type SubTask, type InsertSubTask,
+  type TimeEntry, type InsertTimeEntry,
+  type HourlyRate, type InsertHourlyRate,
   type Invoice, type InsertInvoice,
   type InvoiceItem, type InsertInvoiceItem,
   type InvoiceSettings, type InsertInvoiceSettings,
   type InsertClientAssignment,
   type ClientTaskOverride, type InsertClientTaskOverride,
-  type ClientSubtaskOverride, type InsertClientSubtaskOverride
+  type ClientSubtaskOverride, type InsertClientSubtaskOverride,
+  type ClientHourlyRate, type InsertClientHourlyRate,
+  type Role, type InsertRole,
+  type SystemSetting,
+  type DocumentRequest, type InsertDocumentRequest,
+  type DocumentRequestItem, type InsertDocumentRequestItem,
+  type EmailLog, type InsertEmailLog,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, and, desc, gte, lte, inArray } from "drizzle-orm";
+import { eq, and, desc, gte, lte, inArray, count } from "drizzle-orm";
 
 export interface IStorage {
   // Users (Admin)
@@ -33,6 +41,7 @@ export interface IStorage {
   // Assignments
   assignClient(assignment: InsertClientAssignment): Promise<void>;
   getClientAssignments(employeeId: string): Promise<number[]>; // returns client IDs
+  getClientsByEmployee(employeeId: string): Promise<Client[]>; // returns full client objects
   
   // Tasks
   getMainTasks(): Promise<MainTask[]>;
@@ -95,6 +104,42 @@ export interface IStorage {
   getEmployeeClientAssignments(employeeId: string): Promise<{ clientId: number; taskLevel: number | null }[]>;
   getAllClientAssignmentsWithLevels(): Promise<{ id: number; employeeId: string; clientId: number; taskLevel: number | null }[]>;
   updateClientTaskLevel(employeeId: string, clientId: number, taskLevel: number | null): Promise<void>;
+
+  // Client-specific hourly rate overrides
+  getClientHourlyRates(clientId: number): Promise<ClientHourlyRate[]>;
+  upsertClientHourlyRate(rate: InsertClientHourlyRate): Promise<ClientHourlyRate>;
+  deleteClientHourlyRate(clientId: number, billingLevel: number): Promise<void>;
+
+  // Delete client
+  deleteClient(id: number): Promise<void>;
+
+  // Roles
+  getRoles(): Promise<Role[]>;
+  getRole(id: number): Promise<Role | undefined>;
+  createRole(role: InsertRole): Promise<Role>;
+  updateRole(id: number, updates: Partial<InsertRole>): Promise<Role>;
+  deleteRole(id: number): Promise<void>;
+
+  // Invoice sequence number
+  getNextInvoiceSequenceNumber(clientId: number): Promise<number>;
+
+  // System settings
+  getSetting(key: string): Promise<string | null>;
+  getSettings(keys: string[]): Promise<Record<string, string>>;
+  setSetting(key: string, value: string): Promise<void>;
+  setSettings(settings: Record<string, string>): Promise<void>;
+
+  // Document requests
+  getDocumentRequests(clientId?: number): Promise<(DocumentRequest & { items: DocumentRequestItem[]; client: Client | null })[]>;
+  getDocumentRequest(id: number): Promise<(DocumentRequest & { items: DocumentRequestItem[] }) | undefined>;
+  createDocumentRequest(req: InsertDocumentRequest, items: InsertDocumentRequestItem[]): Promise<DocumentRequest>;
+  updateDocumentRequest(id: number, updates: Partial<DocumentRequest>): Promise<DocumentRequest>;
+  upsertDocumentRequestItems(requestId: number, items: InsertDocumentRequestItem[]): Promise<void>;
+  getDueReminders(): Promise<(DocumentRequest & { client: Client | null })[]>;
+
+  // Email logs
+  createEmailLog(log: InsertEmailLog): Promise<EmailLog>;
+  getEmailLogs(limit?: number): Promise<EmailLog[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -151,6 +196,12 @@ export class DatabaseStorage implements IStorage {
   async getClientAssignments(employeeId: string): Promise<number[]> {
     const assignments = await db.select().from(clientAssignments).where(eq(clientAssignments.employeeId, employeeId));
     return assignments.map(a => a.clientId);
+  }
+
+  async getClientsByEmployee(employeeId: string): Promise<Client[]> {
+    const clientIds = await this.getClientAssignments(employeeId);
+    if (clientIds.length === 0) return [];
+    return await db.select().from(clients).where(inArray(clients.id, clientIds));
   }
 
   // Tasks
@@ -451,7 +502,7 @@ export class DatabaseStorage implements IStorage {
           eq(clientAssignments.clientId, clientId)
         )
       );
-    
+
     if (existing.length > 0) {
       await db.update(clientAssignments)
         .set({ taskLevel })
@@ -470,6 +521,191 @@ export class DatabaseStorage implements IStorage {
         assignedAt: new Date(),
       });
     }
+  }
+
+  // Client-specific hourly rate overrides
+  async getClientHourlyRates(clientId: number): Promise<ClientHourlyRate[]> {
+    return await db.select().from(clientHourlyRates)
+      .where(eq(clientHourlyRates.clientId, clientId))
+      .orderBy(clientHourlyRates.billingLevel);
+  }
+
+  async upsertClientHourlyRate(rate: InsertClientHourlyRate): Promise<ClientHourlyRate> {
+    const [existing] = await db.select().from(clientHourlyRates).where(
+      and(
+        eq(clientHourlyRates.clientId, rate.clientId),
+        eq(clientHourlyRates.billingLevel, rate.billingLevel)
+      )
+    );
+    if (existing) {
+      const [updated] = await db.update(clientHourlyRates)
+        .set({ rateAmount: rate.rateAmount.toString(), updatedAt: new Date() })
+        .where(eq(clientHourlyRates.id, existing.id))
+        .returning();
+      return updated;
+    }
+    const [created] = await db.insert(clientHourlyRates).values({
+      ...rate,
+      rateAmount: rate.rateAmount.toString(),
+    }).returning();
+    return created;
+  }
+
+  async deleteClientHourlyRate(clientId: number, billingLevel: number): Promise<void> {
+    await db.delete(clientHourlyRates).where(
+      and(
+        eq(clientHourlyRates.clientId, clientId),
+        eq(clientHourlyRates.billingLevel, billingLevel)
+      )
+    );
+  }
+
+  // Delete client (admin-only)
+  async deleteClient(id: number): Promise<void> {
+    await db.delete(clientAssignments).where(eq(clientAssignments.clientId, id));
+    await db.delete(clientTaskOverrides).where(eq(clientTaskOverrides.clientId, id));
+    await db.delete(clientSubtaskOverrides).where(eq(clientSubtaskOverrides.clientId, id));
+    await db.delete(clientHourlyRates).where(eq(clientHourlyRates.clientId, id));
+    await db.delete(clients).where(eq(clients.id, id));
+  }
+
+  // Roles
+  async getRoles(): Promise<Role[]> {
+    return await db.select().from(roles).orderBy(roles.name);
+  }
+
+  async getRole(id: number): Promise<Role | undefined> {
+    const [role] = await db.select().from(roles).where(eq(roles.id, id));
+    return role;
+  }
+
+  async createRole(role: InsertRole): Promise<Role> {
+    const [created] = await db.insert(roles).values({
+      ...role,
+      permissions: role.permissions as Record<string, boolean>,
+    }).returning();
+    return created;
+  }
+
+  async updateRole(id: number, updates: Partial<InsertRole>): Promise<Role> {
+    const [updated] = await db.update(roles)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(roles.id, id))
+      .returning();
+    return updated;
+  }
+
+  async deleteRole(id: number): Promise<void> {
+    await db.delete(roles).where(and(eq(roles.id, id), eq(roles.isDefault, false)));
+  }
+
+  // Invoice sequence number
+  async getNextInvoiceSequenceNumber(clientId: number): Promise<number> {
+    const [result] = await db.select({ total: count() })
+      .from(invoices)
+      .where(eq(invoices.clientId, clientId));
+    return (result?.total ?? 0) + 1;
+  }
+
+  // System settings
+  async getSetting(key: string): Promise<string | null> {
+    const [row] = await db.select().from(systemSettings).where(eq(systemSettings.key, key));
+    return row?.value ?? null;
+  }
+
+  async getSettings(keys: string[]): Promise<Record<string, string>> {
+    const rows = await db.select().from(systemSettings).where(inArray(systemSettings.key, keys));
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      if (row.value !== null && row.value !== undefined) result[row.key] = row.value;
+    }
+    return result;
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    const existing = await db.select().from(systemSettings).where(eq(systemSettings.key, key));
+    if (existing.length > 0) {
+      await db.update(systemSettings).set({ value, updatedAt: new Date() }).where(eq(systemSettings.key, key));
+    } else {
+      await db.insert(systemSettings).values({ key, value });
+    }
+  }
+
+  async setSettings(settings: Record<string, string>): Promise<void> {
+    for (const [key, value] of Object.entries(settings)) {
+      await this.setSetting(key, value);
+    }
+  }
+
+  // Document requests
+  async getDocumentRequests(clientId?: number): Promise<(DocumentRequest & { items: DocumentRequestItem[]; client: Client | null })[]> {
+    const reqs = clientId
+      ? await db.select().from(documentRequests).where(eq(documentRequests.clientId, clientId)).orderBy(desc(documentRequests.createdAt))
+      : await db.select().from(documentRequests).orderBy(desc(documentRequests.createdAt));
+    const results = [];
+    for (const req of reqs) {
+      const items = await db.select().from(documentRequestItems)
+        .where(eq(documentRequestItems.requestId, req.id))
+        .orderBy(documentRequestItems.displayOrder);
+      const [client] = await db.select().from(clients).where(eq(clients.id, req.clientId));
+      results.push({ ...req, items, client: client ?? null });
+    }
+    return results;
+  }
+
+  async getDocumentRequest(id: number): Promise<(DocumentRequest & { items: DocumentRequestItem[] }) | undefined> {
+    const [req] = await db.select().from(documentRequests).where(eq(documentRequests.id, id));
+    if (!req) return undefined;
+    const items = await db.select().from(documentRequestItems)
+      .where(eq(documentRequestItems.requestId, id))
+      .orderBy(documentRequestItems.displayOrder);
+    return { ...req, items };
+  }
+
+  async createDocumentRequest(req: InsertDocumentRequest, items: InsertDocumentRequestItem[]): Promise<DocumentRequest> {
+    const [created] = await db.insert(documentRequests).values(req).returning();
+    if (items.length > 0) {
+      await db.insert(documentRequestItems).values(items.map((item, i) => ({ ...item, requestId: created.id, displayOrder: i })));
+    }
+    return created;
+  }
+
+  async updateDocumentRequest(id: number, updates: Partial<DocumentRequest>): Promise<DocumentRequest> {
+    const [updated] = await db.update(documentRequests).set({ ...updates, updatedAt: new Date() }).where(eq(documentRequests.id, id)).returning();
+    return updated;
+  }
+
+  async upsertDocumentRequestItems(requestId: number, items: InsertDocumentRequestItem[]): Promise<void> {
+    await db.delete(documentRequestItems).where(eq(documentRequestItems.requestId, requestId));
+    if (items.length > 0) {
+      await db.insert(documentRequestItems).values(items.map((item, i) => ({ ...item, requestId, displayOrder: i })));
+    }
+  }
+
+  async getDueReminders(): Promise<(DocumentRequest & { client: Client | null })[]> {
+    const now = new Date();
+    const reqs = await db.select().from(documentRequests).where(
+      and(
+        eq(documentRequests.status, "Sent"),
+      )
+    );
+    const due = reqs.filter(r => r.nextReminderAt && r.nextReminderAt <= now);
+    const results = [];
+    for (const req of due) {
+      const [client] = await db.select().from(clients).where(eq(clients.id, req.clientId));
+      results.push({ ...req, client: client ?? null });
+    }
+    return results;
+  }
+
+  // Email logs
+  async createEmailLog(log: InsertEmailLog): Promise<EmailLog> {
+    const [created] = await db.insert(emailLogs).values(log).returning();
+    return created;
+  }
+
+  async getEmailLogs(limit = 50): Promise<EmailLog[]> {
+    return await db.select().from(emailLogs).orderBy(desc(emailLogs.createdAt)).limit(limit);
   }
 }
 

@@ -17,6 +17,9 @@ import InvoiceReviewPage from "@/pages/admin/invoice-review";
 import InvoiceSettingsPage from "@/pages/admin/invoice-settings";
 import UsersPage from "@/pages/admin/users";
 import TimeEntriesPage from "@/pages/admin/time-entries";
+import RolesPage from "@/pages/admin/roles";
+import SuperAdminPage from "@/pages/admin/super-admin";
+import DocumentRequestsPage from "@/pages/admin/document-requests";
 import NotFound from "@/pages/not-found";
 
 function Router() {
@@ -79,6 +82,20 @@ function Router() {
         <Layout>
           <RatesPage />
         </Layout>
+      </Route>
+
+      <Route path="/admin/roles">
+        <Layout>
+          <RolesPage />
+        </Layout>
+      </Route>
+
+      <Route path="/admin/super-admin">
+        <Layout><SuperAdminPage /></Layout>
+      </Route>
+
+      <Route path="/admin/document-requests">
+        <Layout><DocumentRequestsPage /></Layout>
       </Route>
 
       <Route component={NotFound} />

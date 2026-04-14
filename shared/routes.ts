@@ -75,7 +75,7 @@ export const api = {
       method: 'PATCH' as const,
       path: '/api/users/:id',
       input: z.object({
-        role: z.enum(["Employee", "Admin Assistant", "Administrator"]).optional(),
+        role: z.string().optional(), // Now any custom role name
         reviewLevel: z.number().optional(),
         status: z.enum(["Active", "Inactive"]).optional(),
       }),
@@ -218,7 +218,8 @@ export const api = {
         pausedDuration: z.number().optional(),
         totalDuration: z.number().optional(),
         endTime: z.string().nullable().optional(),
-        rateLevel: z.number().optional(),
+        rateLevel: z.number().nullable().optional(),
+        billingLevel: z.number().nullable().optional(),
       }),
       responses: {
         200: z.custom<typeof timeEntries.$inferSelect>(),

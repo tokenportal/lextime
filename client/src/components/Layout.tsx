@@ -3,19 +3,21 @@ import { Link, useLocation, Redirect } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 import { getPermissions } from "@shared/permissions";
-import { 
-  LayoutDashboard, 
-  Users, 
-  Briefcase, 
-  CheckSquare, 
-  Clock, 
-  FileText, 
-  DollarSign, 
+import {
+  LayoutDashboard,
+  Users,
+  Briefcase,
+  CheckSquare,
+  Clock,
+  FileText,
+  DollarSign,
   LogOut,
   User,
   Shield,
   UserCog,
-  Settings
+  Settings,
+  ShieldCheck,
+  FileQuestion,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -32,6 +34,7 @@ export function Layout({ children }: LayoutProps) {
   const adminLinks = [
     { href: "/admin/dashboard", icon: LayoutDashboard, label: "Dashboard", show: permissions.canAccessDashboard },
     { href: "/admin/users", icon: Users, label: "Users", show: permissions.canAccessUsers },
+    { href: "/admin/roles", icon: ShieldCheck, label: "Roles", show: permissions.canAccessRoles },
     { href: "/admin/clients", icon: Briefcase, label: "Clients", show: permissions.canAccessClients },
     { href: "/admin/tasks", icon: CheckSquare, label: "Tasks", show: permissions.canAccessTasks },
     { href: "/admin/client-assignment", icon: UserCog, label: "Client Assignment", show: permissions.canAccessClientAssignment },
@@ -39,6 +42,8 @@ export function Layout({ children }: LayoutProps) {
     { href: "/admin/invoices", icon: FileText, label: "Invoices", show: permissions.canAccessInvoices },
     { href: "/admin/invoice-settings", icon: Settings, label: "Invoice Settings", show: permissions.canAccessInvoiceSettings },
     { href: "/admin/rates", icon: DollarSign, label: "Rates", show: permissions.canAccessRates },
+    { href: "/admin/document-requests", icon: FileQuestion, label: "Document Requests", show: permissions.canAccessClients },
+    { href: "/admin/super-admin", icon: Shield, label: "Super Admin", show: permissions.canSuperAdmin },
   ].filter(link => link.show);
 
   useEffect(() => {
